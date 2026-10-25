@@ -147,3 +147,11 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Python and AWS SAM
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.aws-sam/
+samconfig.toml

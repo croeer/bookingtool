@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Kreativcafe Kleine Auszeit - serverless booking system
+Parameters:
+  FromEmail:
+    Type: String
+    Description: SES-verified sender address in this region
+  CalendarSecretArn:
+    Type: String
+    Description: Existing Secrets Manager secret with username, password, calendar_url
+  CognitoDomainPrefix:
+    Type: String
+    Description: Globally unique Cognito hosted-login prefix
+    AllowedPattern: '[a-z0-9][a-z0-9-]{1,50}[a-z0-9]'
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref Bookings
+Resources:
+  Bookings:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+  WebBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+  OriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-web'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-security'
+        SecurityHeadersConfig:
+          ContentTypeOptions: {Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          StrictTransportSecurity: {AccessControlMaxAgeSec: 31536000, IncludeSubdomains: true, Override: true}
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://*.execute-api.eu-central-1.amazonaws.com https://*.auth.eu-central-1.amazoncognito.com; base-uri 'self'; object-src 'none'; form-action 'self'; frame-ancestors 'self' https://www.kreativcafe-kleineauszeit.de https://kreativcafe-kleineauszeit.de"
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          # AWS managed CachingDisabled; small app, no stale runtime config.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${WebBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt WebBucket.Arn, !Sub '${WebBucket.Arn}/*']
+            Condition:
+              Bool: {aws:SecureTransport: false}
+  AdminPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'ON'
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: admins, UserPoolId: !Ref AdminPool}
+  AdminClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref AdminPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub 'https://${Distribution.DomainName}/']
+      LogoutURLs: [!Sub 'https://${Distribution.DomainName}/']
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits: {AccessToken: minutes, IdToken: minutes}
+  AdminDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {Domain: !Ref CognitoDomainPrefix, UserPoolId: !Ref AdminPool}
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+      CorsConfiguration:
+        AllowOrigins: [!Sub 'https://${Distribution.DomainName}']
+        AllowHeaders: [Content-Type, Authorization, Idempotency-Key]
+        AllowMethods: [GET, POST, PATCH, OPTIONS]
+      Auth:
+        Authorizers:
+          AdminJwt:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${AdminPool}'
+              audience: [!Ref AdminClient]
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Bookings}
+      Events:
+        Slots:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /slots, Method: GET}
+        Booking:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /bookings, Method: POST}
+        Admin:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: '/admin/{proxy+}'
+            Method: ANY
+            Auth: {Authorizer: AdminJwt, AuthorizationScopes: [openid]}
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: worker.handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          FROM_EMAIL: !Ref FromEmail
+          CALENDAR_SECRET_ARN: !Ref CalendarSecretArn
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref Bookings}
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CalendarSecretArn
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+              Condition:
+                StringEquals: {ses:FromAddress: !Ref FromEmail}
+      Events:
+        RetryOutbox:
+          Type: Schedule
+          Properties: {Schedule: 'rate(1 minute)', Enabled: true}
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${ApiFunction}', RetentionInDays: 30}
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${WorkerFunction}', RetentionInDays: 30}
+  WorkerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Delivery failures; inspect outbox and worker logs. Attach an SNS alarm action before production.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref WorkerFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  ApiUrl: {Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com'}
+  WebsiteUrl: {Value: !Sub 'https://${Distribution.DomainName}'}
+  WebBucketName: {Value: !Ref WebBucket}
+  AdminUserPoolId: {Value: !Ref AdminPool}
+  AdminClientId: {Value: !Ref AdminClient}
+  LoginUrl: {Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'}
+  TableName: {Value: !Ref Bookings}

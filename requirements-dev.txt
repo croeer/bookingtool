@@ -1,0 +1,4 @@
+-r backend/requirements.txt
+pytest>=8,<10
+moto[dynamodb]>=5,<6
+PyYAML>=6,<7
